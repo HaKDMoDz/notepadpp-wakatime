@@ -1,92 +1,98 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using WakaTime.Forms;
 using WakaTime.Properties;
+using System.Net;
+using System.Text.RegularExpressions;
 
 namespace WakaTime
 {
     class WakaTime
     {
         #region Fields
-        internal const string NativeName = "WakaTime";
-        private const string CurrentWakaTimeCLIVersion = "4.0.13"; // https://github.com/wakatime/wakatime/blob/master/HISTORY.rst
-        private const string _cliUrl = "https://github.com/wakatime/wakatime/archive/master.zip";
-        private static string _version = CoreAssembly.Version.Major.ToString() + '.' + CoreAssembly.Version.Minor.ToString() + '.' + CoreAssembly.Version.Build.ToString();
-        internal const string UserAgent = "notepadpp-wakatime";
-        private const string EditorName = "notepadpp";
-        private const string CurrentPythonVersion = "3.4.3";
-        private static int _editorVersion;
-        private static string _pythonBinaryLocation = null;
+        private static WakaTimeConfigFile _wakaTimeConfigFile;
+        private static SettingsForm _settingsForm;
 
-        private static string _iniFilePath;
         private static int _idMyDlg = -1;
         private static readonly Bitmap TbBmp = Resources.wakatime;
-        public static string ApiKey;
+
+        static readonly PythonCliParameters PythonCliParameters = new PythonCliParameters();
         private static string _lastFile;
         private static DateTime _lastHeartbeat = DateTime.UtcNow.AddMinutes(-3);
-        private static readonly object ThreadLock = new object();
-        static readonly bool Is64BitProcess = (IntPtr.Size == 8);
-        static readonly bool Is64BitOperatingSystem = Is64BitProcess || InternalCheckIsWow64();        
+
+        // Settings
+        public static bool Debug;
+        public static string ApiKey;
+        public static string Proxy;
+
         #endregion
 
         #region StartUp/CleanUp
+
         internal static void CommandMenuInit()
         {
-            _editorVersion = (int)Win32.SendMessage(PluginBase.NppData._nppHandle, NppMsg.NPPM_GETNPPVERSION, 0, 0);
-
-            var sbIniFilePath = new StringBuilder(Win32.MAX_PATH);
-            Win32.SendMessage(PluginBase.NppData._nppHandle, NppMsg.NPPM_GETPLUGINSCONFIGDIR, Win32.MAX_PATH, sbIniFilePath);
-            _iniFilePath = sbIniFilePath.ToString();
-            if (!Directory.Exists(_iniFilePath)) Directory.CreateDirectory(_iniFilePath);
 
             try
             {
-                // Make sure python is installed
-                if (!IsPythonInstalled())
-                {
-                    var url = GetPythonDownloadUrl();
-                    Downloader.DownloadPython(url, GetConfigDir());
-                }
+                Logger.Info(string.Format("Initializing WakaTime v{0}", WakaTimeConstants.PluginVersion));
 
-                if (!DoesCliExist() || !IsCliLatestVersion())
-                {
-                    try
-                    {
-                        Directory.Delete(GetConfigDir() + "\\wakatime-master", true);
-                    }
-                    catch { /* ignored */ }
-                    Downloader.DownloadCli(_cliUrl, GetConfigDir());
-                }
+                _settingsForm = new SettingsForm();
+                _settingsForm.ConfigSaved += SettingsFormOnConfigSaved;
+                _wakaTimeConfigFile = new WakaTimeConfigFile();
+                var sbIniFilePath = new StringBuilder(Win32.MAX_PATH);
+                Win32.SendMessage(PluginBase.NppData._nppHandle, NppMsg.NPPM_GETPLUGINSCONFIGDIR, Win32.MAX_PATH, sbIniFilePath);
+                GetSettings();
 
-                ApiKey = Config.GetApiKey();
+                Task.Run(() => { InitializeWakaTimeAsync(); });
 
-                if (string.IsNullOrWhiteSpace(ApiKey))
+                // add menu item
+                PluginBase.SetCommand(0, "Wakatime Settings", SettingsPopup, new ShortcutKey(false, false, false, Keys.None));
+                _idMyDlg = 0;
+
+                // prompt for api key if not already set
+                if (string.IsNullOrEmpty(ApiKey))
                     PromptApiKey();
+
+                Logger.Info(string.Format("Finished initializing WakaTime v{0}", WakaTimeConstants.PluginVersion));
             }
             catch (Exception ex)
             {
-                Logger.Error("An exception occured : " + ex.Message);
+                Logger.Error("Error initializing Wakatime", ex);
+            }
+        }
+
+        private static void InitializeWakaTimeAsync()
+        {
+            // Make sure python is installed
+            if (!PythonManager.IsPythonInstalled())
+            {
+                Downloader.DownloadAndInstallPython();
             }
 
-            // add menu item
-            PluginBase.SetCommand(0, "API Key", PromptApiKey, new ShortcutKey(false, false, false, Keys.None));
-            _idMyDlg = 0;
+            if (!DoesCliExist() || !IsCliLatestVersion())
+            {
+                Downloader.DownloadAndInstallCli();
+            }
+
+            if (string.IsNullOrEmpty(ApiKey))
+                PromptApiKey();
         }
+
         internal static void SetToolBarIcon()
         {
-            var tbIcons = new toolbarIcons {hToolbarBmp = TbBmp.GetHbitmap()};
+            var tbIcons = new toolbarIcons { hToolbarBmp = TbBmp.GetHbitmap() };
             var pTbIcons = Marshal.AllocHGlobal(Marshal.SizeOf(tbIcons));
             Marshal.StructureToPtr(tbIcons, pTbIcons, false);
             Win32.SendMessage(PluginBase.NppData._nppHandle, NppMsg.NPPM_ADDTOOLBARICON, PluginBase.FuncItems.Items[_idMyDlg]._cmdID, pTbIcons);
             Marshal.FreeHGlobal(pTbIcons);
         }
+
         internal static void PluginCleanUp()
         {
         }
@@ -98,19 +104,25 @@ namespace WakaTime
             var form = new ApiKeyForm();
             form.ShowDialog();
         }
+
+        private static void SettingsPopup()
+        {
+            _settingsForm.ShowDialog();
+        }
         #endregion
 
         #region Methods
-
-        public static string GetPythonDownloadUrl()
+        private static void SettingsFormOnConfigSaved(object sender, EventArgs eventArgs)
         {
-            var url = "https://www.python.org/ftp/python/" + CurrentPythonVersion + "/python-" + CurrentPythonVersion;
+            _wakaTimeConfigFile.Read();
+            GetSettings();
+        }
 
-            if (Is64BitOperatingSystem)
-                url = url + ".amd64";
-
-            url = url + ".msi";
-            return url;
+        private static void GetSettings()
+        {
+            ApiKey = _wakaTimeConfigFile.ApiKey;
+            Debug = _wakaTimeConfigFile.Debug;
+            Proxy = _wakaTimeConfigFile.Proxy;
         }
 
         public static string GetCurrentFile()
@@ -125,22 +137,19 @@ namespace WakaTime
         public static void HandleActivity(bool isWrite)
         {
             var currentFile = GetCurrentFile();
-            if (currentFile == null) return;
+            if (currentFile == null)
+                return;
 
-            var thread = new Thread(
-                delegate()
-                {
-                    lock (ThreadLock)
-                    {
-                        if (!isWrite && _lastFile != null && !EnoughTimePassed() && currentFile.Equals(_lastFile))
-                            return;
+            if (!isWrite && _lastFile != null && !EnoughTimePassed() && currentFile.Equals(_lastFile))
+                return;
 
-                        SendHeartbeat(currentFile, isWrite);
-                        _lastFile = currentFile;
-                        _lastHeartbeat = DateTime.UtcNow;
-                    }
-                });
-            thread.Start();
+            Task.Run(() =>
+            {
+                SendHeartbeat(currentFile, isWrite);
+            });
+
+            _lastFile = currentFile;
+            _lastHeartbeat = DateTime.UtcNow;
         }
 
         public static bool EnoughTimePassed()
@@ -148,143 +157,122 @@ namespace WakaTime
             return _lastHeartbeat < DateTime.UtcNow.AddMinutes(-1);
         }
 
-        public static string GetPython()
-        {
-            if (_pythonBinaryLocation != null)
-                return _pythonBinaryLocation;
-
-            string[] locations = {
-                "pythonw",
-                "python",
-                "\\Python37\\pythonw",
-                "\\Python36\\pythonw",
-                "\\Python35\\pythonw",
-                "\\Python34\\pythonw",
-                "\\Python33\\pythonw",
-                "\\Python32\\pythonw",
-                "\\Python31\\pythonw",
-                "\\Python30\\pythonw",
-                "\\Python27\\pythonw",
-                "\\Python26\\pythonw",
-                "\\python37\\pythonw",
-                "\\python36\\pythonw",
-                "\\python35\\pythonw",
-                "\\python34\\pythonw",
-                "\\python33\\pythonw",
-                "\\python32\\pythonw",
-                "\\python31\\pythonw",
-                "\\python30\\pythonw",
-                "\\python27\\pythonw",
-                "\\python26\\pythonw",
-                "\\Python37\\python",
-                "\\Python36\\python",
-                "\\Python35\\python",
-                "\\Python34\\python",
-                "\\Python33\\python",
-                "\\Python32\\python",
-                "\\Python31\\python",
-                "\\Python30\\python",
-                "\\Python27\\python",
-                "\\Python26\\python",
-                "\\python37\\python",
-                "\\python36\\python",
-                "\\python35\\python",
-                "\\python34\\python",
-                "\\python33\\python",
-                "\\python32\\python",
-                "\\python31\\python",
-                "\\python30\\python",
-                "\\python27\\python",
-                "\\python26\\python",
-            };
-            foreach (string location in locations)
-            {
-                RunProcess process = new RunProcess(location, "--version");
-
-                process.Run();
-
-                if (process.OK())
-                {
-                    if (process.Output().StartsWith("Python "))
-                    {
-                        _pythonBinaryLocation = location;
-                        return location;
-                    }
-                }
-            }
-            return null;
-        }
-
-        public static string GetConfigDir()
-        {
-            var pluginConfigDir = new StringBuilder(Win32.MAX_PATH);
-            Win32.SendMessage(PluginBase.NppData._nppHandle, NppMsg.NPPM_GETPLUGINSCONFIGDIR, Win32.MAX_PATH, pluginConfigDir);
-            return pluginConfigDir.ToString();
-        }
-
-        public static string GetCli()
-        {
-            return GetConfigDir() + "\\wakatime-master\\wakatime\\cli.py";
-        }
-
         public static void SendHeartbeat(string fileName, bool isWrite)
         {
-            List<String> arguments = new List<String>();
+            PythonCliParameters.Key = ApiKey;
+            PythonCliParameters.File = fileName;
+            PythonCliParameters.Plugin = string.Format("{0}/{1} {2}/{3}", WakaTimeConstants.EditorName, WakaTimeConstants.EditorVersion, WakaTimeConstants.PluginName, WakaTimeConstants.PluginVersion);
+            PythonCliParameters.IsWrite = isWrite;
 
-            arguments.Add(GetCli());
-            arguments.Add("--key");
-            arguments.Add(ApiKey);
-            arguments.Add("--file");
-            arguments.Add(fileName);
-            arguments.Add("--plugin");
-            arguments.Add(EditorName + "/" + _editorVersion + " " + UserAgent + "/" + _version);
-
-            if (isWrite)
-                arguments.Add("--write");
-
-            RunProcess process = new RunProcess(GetPython(), arguments.ToArray());
-            process.RunInBackground();
-        }
-
-        public static bool InternalCheckIsWow64()
-        {
-            if ((Environment.OSVersion.Version.Major != 5 || Environment.OSVersion.Version.Minor < 1) &&
-                Environment.OSVersion.Version.Major < 6) return false;
-
-            using (var p = Process.GetCurrentProcess())
+            var pythonBinary = PythonManager.GetPython();
+            if (pythonBinary != null)
             {
-                bool retVal;
-                return NativeMethods.IsWow64Process(p.Handle, out retVal) && retVal;
+                var process = new RunProcess(pythonBinary, PythonCliParameters.ToArray());
+                if (Debug)
+                {
+                    Logger.Debug(string.Format("[\"{0}\", \"{1}\"]", pythonBinary, string.Join("\", \"", PythonCliParameters.ToArray(true))));
+                    process.Run();
+                    Logger.Debug(string.Format("CLI STDOUT: {0}", process.Output));
+                    Logger.Debug(string.Format("CLI STDERR: {0}", process.Error));
+                }
+                else
+                    process.RunInBackground();
+
+                if (!process.Success)
+                    Logger.Error(string.Format("Could not send heartbeat: {0}", process.Error));
             }
+            else
+                Logger.Error("Could not send heartbeat because python is not installed");
         }
 
         private static bool DoesCliExist()
         {
-            return File.Exists(GetCli());
+            return File.Exists(PythonCliParameters.Cli);
         }
 
         private static bool IsCliLatestVersion()
         {
-            RunProcess process = new RunProcess(GetPython(), GetCli(), "--version");
+            var process = new RunProcess(PythonManager.GetPython(), PythonCliParameters.Cli, "--version");
             process.Run();
-            if (process.OK() && process.Error().Equals(CurrentWakaTimeCLIVersion))
-            {
-                return true;
-            }
 
+            if (process.Success)
+            {
+                var currentVersion = process.Error.Trim();
+                Logger.Info(string.Format("Current wakatime-cli version is {0}", currentVersion));
+
+                Logger.Info("Checking for updates to wakatime-cli...");
+                var latestVersion = WakaTimeConstants.LatestWakaTimeCliVersion();
+
+                if (currentVersion.Equals(latestVersion))
+                {
+                    Logger.Info("wakatime-cli is up to date.");
+                    return true;
+                }
+                else
+                {
+                    Logger.Info(string.Format("Found an updated wakatime-cli v{0}", latestVersion));
+                }
+
+            }
             return false;
         }
 
-        private static bool IsPythonInstalled()
+        public static WebProxy GetProxy()
         {
-            return GetPython() != null;
-        }
+            WebProxy proxy = null;
 
-        static class CoreAssembly
+            try
+            {
+                var proxyStr = Proxy;
+
+                // Regex that matches proxy address with authentication
+                var regProxyWithAuth = new Regex(@"\s*(https?:\/\/)?([^\s:]+):([^\s:]+)@([^\s:]+):(\d+)\s*");
+                var match = regProxyWithAuth.Match(proxyStr);
+
+                if (match.Success)
+                {
+                    var username = match.Groups[2].Value;
+                    var password = match.Groups[3].Value;
+                    var address = match.Groups[4].Value;
+                    var port = match.Groups[5].Value;
+
+                    var credentials = new NetworkCredential(username, password);
+                    proxy = new WebProxy(string.Join(":", address, port), true, null, credentials);
+
+                    Logger.Debug("A proxy with authentication will be used.");
+                    return proxy;
+                }
+
+                // Regex that matches proxy address and port(no authentication)
+                var regProxy = new Regex(@"\s*(https?:\/\/)?([^\s@]+):(\d+)\s*");
+                match = regProxy.Match(proxyStr);
+
+                if (match.Success)
+                {
+                    var address = match.Groups[2].Value;
+                    var port = int.Parse(match.Groups[3].Value);
+
+                    proxy = new WebProxy(address, port);
+
+                    Logger.Debug("A proxy will be used.");
+                    return proxy;
+                }
+
+                Logger.Debug("No proxy will be used. It's either not set or badly formatted.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error("Exception while parsing the proxy string from WakaTime config file. No proxy will be used.", ex);
+            }
+
+            return proxy;
+        }
+        #endregion
+
+        internal static class CoreAssembly
         {
             static readonly Assembly Reference = typeof(CoreAssembly).Assembly;
             public static readonly Version Version = Reference.GetName().Version;
         }
-        #endregion
     }
 }

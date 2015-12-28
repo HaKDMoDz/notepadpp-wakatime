@@ -1,17 +1,19 @@
 notepadpp-wakatime
 =====================
 
-Notepad++ plugin to quantify your coding.
+Metrics, insights, and time tracking automatically generated from your programming activity.
 
 
 Installation
 ------------
 
-1. Download the plugin [WakaTime.dll](https://github.com/wakatime/notepadpp-wakatime/releases/download/2.0.0/WakaTime.dll).
+1. Inside Notepad++ open the Plugin Manager (`Plugins` -> `Plugin Manager` -> `Show Plugin Manager`).
 
-2. Copy WakaTime.dll to your Notepad++ plugins folder at `C:\Program Files\Notepad++\plugins`.
+2. Check the box next to `WakaTime` in the list of plugins.
 
-3. Create a `allowAppDataPlugins.xml` file in your `C:\Program Files\Notepad++` directory.
+![Project Overview](./img/plugin-install.png)
+
+3. Click the `Install` button.
 
 4. Restart Notepad++.
 
@@ -31,4 +33,10 @@ Screen Shots
 Troubleshooting
 ---------------
 
-See https://github.com/wakatime/wakatime#troubleshooting
+WakaTime for Notepad++ logs to `C:\Users\<user>\AppData\Roaming\Notepad++\plugins\config\WakaTime.log`.
+
+Turn on debug mode (click the WakaTime icon in Notepad++) then check your log file.
+
+WakaTime Core logs to `C:\Users\<user>\.wakatime.log`. Check there after looking in your Notepad++ WakaTime.log file.
+
+More help can be found at https://github.com/wakatime/wakatime#troubleshooting.
